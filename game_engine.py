@@ -237,6 +237,41 @@ class SolitaireGame:
     def get_score_rating(self):
         return self.rules.get_score_rating(self.board_layout)
 
+    def randomize_board_state(self, peg_probability=0.5, rng=None):
+        """Randomize PEG/HOLE on playable cells while preserving INVALID cells."""
+        if rng is None:
+            rng = random
+
+        playable_cells = []
+        for row_idx, row in enumerate(self.board_layout):
+            for col_idx, cell in enumerate(row):
+                if cell == CellState.INVALID:
+                    continue
+
+                playable_cells.append((row_idx, col_idx))
+                self.board_layout[row_idx][col_idx] = (
+                    CellState.PEG if rng.random() < peg_probability else CellState.HOLE
+                )
+
+        if not playable_cells:
+            return self.board_layout
+
+        peg_count = sum(
+            1
+            for row_idx, col_idx in playable_cells
+            if self.board_layout[row_idx][col_idx] == CellState.PEG
+        )
+
+        # Keep the randomized state playable and scoreable.
+        if peg_count == 0:
+            row_idx, col_idx = playable_cells[0]
+            self.board_layout[row_idx][col_idx] = CellState.PEG
+        elif peg_count == len(playable_cells):
+            row_idx, col_idx = playable_cells[0]
+            self.board_layout[row_idx][col_idx] = CellState.HOLE
+
+        return self.board_layout
+
 
 class SolitaireGameController:
     """Chatgpted class that manages game state and interactions between the SolitaireGame and the UI.
@@ -277,6 +312,15 @@ class SolitaireGameController:
 
     def clear_selection(self):
         self.selected_peg = None
+
+    def randomize_board_state(self, peg_probability=0.5, seed=None):
+        """Randomize current board state for manual play experimentation."""
+        rng = random.Random(seed) if seed is not None else random
+        self.game.randomize_board_state(peg_probability=peg_probability, rng=rng)
+        self.selected_peg = None
+        self._game_over_fired = False
+        self._check_and_notify_game_over()
+        return self.game.board_layout
 
     # ------------------------------------------------------------------
     # State queries

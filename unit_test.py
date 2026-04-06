@@ -1,6 +1,7 @@
 import unittest
 import game_engine
-
+import random 
+import copy
 
 def _count_pegs(board_layout):
     return sum(row.count(game_engine.CellState.PEG) for row in board_layout)
@@ -227,8 +228,55 @@ class TestGameOverAndScoring(unittest.TestCase):
         self.assertEqual(steps, 0)
         self.assertTrue(automated_mode.is_game_over())
 
-class TestTransition(unittest.TestCase):
-    """Direct coverage for User Stories 1..8."""
+
+
+class TestRandomizeBoard(unittest.TestCase):
+    """Randomize board during manual play (start/stop/start-like state changes)."""
+
+    def test_randomize_board_state_changes_playable_cells(self):
+        game = game_engine.SolitaireGame(
+            board_type=game_engine.BoardType.ENGLISH, board_size=7
+        )
+        before = copy.deepcopy(game.board_layout)
+
+        game.randomize_board_state(peg_probability=0.5, rng=random.Random(42))
+        after = game.board_layout
+
+        self.assertEqual(len(before), len(after))
+        self.assertEqual(len(before[0]), len(after[0]))
+        self.assertNotEqual(before, after)
+
+        for r in range(len(before)):
+            for c in range(len(before[r])):
+                if before[r][c] == game_engine.CellState.INVALID:
+                    self.assertEqual(after[r][c], game_engine.CellState.INVALID)
+                else:
+                    self.assertIn(
+                        after[r][c],
+                        (game_engine.CellState.PEG, game_engine.CellState.HOLE),
+                    )
+
+    def test_controller_randomize_clears_selection(self):
+        game1 = game_engine.SolitaireGame(
+            board_type=game_engine.BoardType.ENGLISH, board_size=7
+        )
+        game2 = game_engine.SolitaireGame(
+            board_type=game_engine.BoardType.ENGLISH, board_size=7
+        )
+
+        c1 = game_engine.SolitaireGameController(game1)
+        c2 = game_engine.SolitaireGameController(game2)
+
+        c1.selected_peg = (3, 3)
+        c2.selected_peg = (3, 3)
+
+        c1.randomize_board_state(seed=123)
+        c2.randomize_board_state(seed=123)
+
+        self.assertIsNone(c1.selected_peg)
+        self.assertIsNone(c2.selected_peg)
+        self.assertEqual(c1.board_layout, c2.board_layout)
+
 
 
 if __name__ == "__main__":
