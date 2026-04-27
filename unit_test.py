@@ -2,9 +2,55 @@ import unittest
 import game_engine
 import random 
 import copy
+import os
+import tempfile
 
 def _count_pegs(board_layout):
     return sum(row.count(game_engine.CellState.PEG) for row in board_layout)
+
+
+def _serialize_board(board_layout):
+    return game_engine.serialize_board_layout(board_layout)
+
+
+def _make_manual_move(controller, manual_mode, start_pos, end_pos):
+    sr, sc = start_pos
+    er, ec = end_pos
+    select_action = manual_mode.make_move("peg", sr, sc)
+    move_action = manual_mode.make_move("hole", er, ec)
+    return select_action, move_action
+
+
+def _play_n_manual_moves(controller, manual_mode, move_count):
+    moves_made = 0
+    while moves_made < move_count and not controller.is_game_over():
+        valid_moves = controller.game.get_valid_moves()
+        if not valid_moves:
+            break
+
+        start_pos, end_pos = valid_moves[0]
+        _, move_action = _make_manual_move(controller, manual_mode, start_pos, end_pos)
+        if move_action != "moved":
+            raise AssertionError("Expected a valid manual move to succeed.")
+        moves_made += 1
+
+    return moves_made
+
+
+def _play_manual_until_game_over(controller, manual_mode, max_steps=10000):
+    steps = 0
+    while steps < max_steps and not controller.is_game_over():
+        valid_moves = controller.game.get_valid_moves()
+        if not valid_moves:
+            break
+
+        start_pos, end_pos = valid_moves[0]
+        _, move_action = _make_manual_move(controller, manual_mode, start_pos, end_pos)
+        if move_action != "moved":
+            raise AssertionError("Expected a valid manual move to succeed.")
+        steps += 1
+
+    return steps
 
 
 #chatgpt codex 5.3 - generated unit tests for the game engine and controller logic, covering board generation, move validation, game over detection, and scoring. Tests verify correct behavior for different board types and sizes, valid/invalid moves, and game over conditions.
@@ -276,6 +322,198 @@ class TestRandomizeBoard(unittest.TestCase):
         self.assertIsNone(c1.selected_peg)
         self.assertIsNone(c2.selected_peg)
         self.assertEqual(c1.board_layout, c2.board_layout)
+
+
+class TestGameRecordingAndReplay(unittest.TestCase):
+    """Acceptance tests for recording and replay across all required scenarios."""
+
+    def _record_manual_game(self, use_randomize=False):
+        controller = game_engine.SolitaireGameController(
+            game_engine.SolitaireGame(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        )
+        manual_mode = game_engine.ManualGameMode(controller)
+
+        manual_mode.start_new_game(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        controller.start_recording(mode_name="Manual")
+
+        if use_randomize:
+            _play_n_manual_moves(controller, manual_mode, move_count=2)
+            controller.randomize_board_state(seed=11)
+            _play_n_manual_moves(controller, manual_mode, move_count=3)
+            controller.randomize_board_state(seed=22)
+
+        _play_manual_until_game_over(controller, manual_mode)
+
+        recording = controller.stop_recording()
+        if recording is None:
+            raise AssertionError("Expected manual recording data to be available.")
+        return controller, recording
+
+    def _record_automated_game(self):
+        controller = game_engine.SolitaireGameController(
+            game_engine.SolitaireGame(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        )
+        automated_mode = game_engine.AutomatedGameMode(controller)
+
+        automated_mode.start_new_game(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        controller.start_recording(mode_name="Automated")
+
+        random.seed(12345)
+        automated_mode.play_until_game_over(max_steps=10000)
+
+        recording = controller.stop_recording()
+        if recording is None:
+            raise AssertionError("Expected automated recording data to be available.")
+        return controller, recording
+
+    def _save_recording_to_temp_file(self, controller):
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        temp_path = temp_file.name
+        temp_file.close()
+        controller.save_recording(temp_path)
+        return temp_path
+
+    def test_1_complete_manual_game_without_randomize_is_recorded(self):
+        _, recording = self._record_manual_game(use_randomize=False)
+
+        self.assertIsNotNone(recording)
+        event_types = [event["type"] for event in recording["events"]]
+
+        self.assertGreater(event_types.count("move"), 0)
+        self.assertEqual(event_types[0], "start_new_game")
+        self.assertNotIn("randomize", event_types)
+        self.assertEqual(event_types[-1], "game_over")
+
+    def test_2_complete_manual_game_without_randomize_is_replayed(self):
+        original_controller, _ = self._record_manual_game(use_randomize=False)
+        expected_board = _serialize_board(original_controller.board_layout)
+
+        temp_path = self._save_recording_to_temp_file(original_controller)
+        self.addCleanup(lambda: os.path.exists(temp_path) and os.remove(temp_path))
+
+        replay_controller = game_engine.SolitaireGameController()
+        replay_result = replay_controller.replay_from_file(temp_path)
+
+        self.assertTrue(replay_result["is_game_over"])
+        self.assertEqual(_serialize_board(replay_controller.board_layout), expected_board)
+
+    def test_3_complete_manual_game_with_randomize_is_recorded(self):
+        _, recording = self._record_manual_game(use_randomize=True)
+
+        self.assertIsNotNone(recording)
+        event_types = [event["type"] for event in recording["events"]]
+
+        self.assertGreater(event_types.count("move"), 0)
+        self.assertGreater(event_types.count("randomize"), 0)
+        self.assertEqual(event_types[0], "start_new_game")
+        self.assertEqual(event_types[-1], "game_over")
+
+    def test_4_complete_manual_game_with_randomize_is_replayed(self):
+        original_controller, _ = self._record_manual_game(use_randomize=True)
+        expected_board = _serialize_board(original_controller.board_layout)
+
+        temp_path = self._save_recording_to_temp_file(original_controller)
+        self.addCleanup(lambda: os.path.exists(temp_path) and os.remove(temp_path))
+
+        replay_controller = game_engine.SolitaireGameController()
+        replay_result = replay_controller.replay_from_file(temp_path)
+
+        self.assertTrue(replay_result["is_game_over"])
+        self.assertEqual(_serialize_board(replay_controller.board_layout), expected_board)
+
+    def test_5_complete_automated_game_is_recorded(self):
+        _, recording = self._record_automated_game()
+
+        self.assertIsNotNone(recording)
+        event_types = [event["type"] for event in recording["events"]]
+        move_sources = [
+            event.get("move_source")
+            for event in recording["events"]
+            if event.get("type") == "move"
+        ]
+
+        self.assertGreater(event_types.count("move"), 0)
+        self.assertEqual(event_types[0], "start_new_game")
+        self.assertEqual(event_types[-1], "game_over")
+        self.assertTrue(all(source == "automated" for source in move_sources))
+
+    def test_6_complete_automated_game_is_replayed(self):
+        original_controller, _ = self._record_automated_game()
+        expected_board = _serialize_board(original_controller.board_layout)
+
+        temp_path = self._save_recording_to_temp_file(original_controller)
+        self.addCleanup(lambda: os.path.exists(temp_path) and os.remove(temp_path))
+
+        replay_controller = game_engine.SolitaireGameController()
+        replay_result = replay_controller.replay_from_file(temp_path)
+
+        self.assertTrue(replay_result["is_game_over"])
+        self.assertEqual(_serialize_board(replay_controller.board_layout), expected_board)
+
+
+class TestReplayNavigationAndRecordingSemantics(unittest.TestCase):
+    def test_start_recording_then_new_game_keeps_new_board_as_first_entry(self):
+        controller = game_engine.SolitaireGameController(
+            game_engine.SolitaireGame(board_type=game_engine.BoardType.DIAMOND, board_size=9)
+        )
+
+        controller.start_recording(mode_name="Manual")
+        controller.start_new_game(
+            board_type=game_engine.BoardType.ENGLISH,
+            board_size=7,
+            mode_name="Manual",
+        )
+
+        recording = controller.stop_recording()
+        if recording is None:
+            raise AssertionError("Expected recording data to be available.")
+
+        self.assertEqual(len(recording["events"]), 1)
+        self.assertEqual(recording["events"][0]["type"], "start_new_game")
+        self.assertEqual(recording["events"][0]["board_type"], game_engine.BoardType.ENGLISH)
+        self.assertEqual(recording["events"][0]["board_size"], 7)
+
+    def test_replay_session_supports_next_previous_and_complete_navigation(self):
+        controller = game_engine.SolitaireGameController(
+            game_engine.SolitaireGame(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        )
+        manual_mode = game_engine.ManualGameMode(controller)
+
+        manual_mode.start_new_game(board_type=game_engine.BoardType.ENGLISH, board_size=7)
+        controller.start_recording(mode_name="Manual")
+
+        start_pos, end_pos = controller.game.get_valid_moves()[0]
+        _make_manual_move(controller, manual_mode, start_pos, end_pos)
+        controller.randomize_board_state(seed=77)
+
+        recording = controller.stop_recording()
+        if recording is None:
+            raise AssertionError("Expected recording data to be available.")
+
+        expected_final_board = _serialize_board(controller.board_layout)
+
+        replay_controller = game_engine.SolitaireGameController()
+        replay_session = game_engine.ReplaySession(recording)
+
+        replay_session.apply_current_to_controller(replay_controller)
+        first_board = _serialize_board(replay_controller.board_layout)
+
+        self.assertGreaterEqual(replay_session.total_steps, 3)
+        self.assertEqual(replay_session.position, 0)
+
+        replay_session.step_next()
+        replay_session.apply_current_to_controller(replay_controller)
+        second_board = _serialize_board(replay_controller.board_layout)
+
+        self.assertNotEqual(first_board, second_board)
+
+        replay_session.step_previous()
+        replay_session.apply_current_to_controller(replay_controller)
+        self.assertEqual(_serialize_board(replay_controller.board_layout), first_board)
+
+        replay_session.jump_to_complete()
+        replay_session.apply_current_to_controller(replay_controller)
+        self.assertEqual(_serialize_board(replay_controller.board_layout), expected_final_board)
 
 
 

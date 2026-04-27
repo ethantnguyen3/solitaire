@@ -1,5 +1,6 @@
 from enum import Enum
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+import json
 import random
 from abc import ABC, abstractmethod
 #chatgpt 5.3 - implemented the game engine and controller logic for a peg solitaire game, including board generation for different types, move validation, game over detection, and scoring. The code is structured to separate game rules from state management and UI interactions, making it easy to test and extend.
@@ -14,6 +15,30 @@ class BoardType:
     ENGLISH = "English"
     HEXAGON = "Hexagon"
     DIAMOND = "Diamond"
+
+
+RECORDING_FILE_VERSION = 1
+
+
+def serialize_board_layout(board_layout):
+    """Serialize CellState board to primitive values for JSON storage."""
+    return [[cell.value for cell in row] for row in board_layout]
+
+
+def deserialize_board_layout(serialized_board):
+    """Deserialize primitive board values back into CellState values."""
+    value_map = {state.value: state for state in CellState}
+    board_layout = []
+
+    for row in serialized_board:
+        board_row = []
+        for cell_value in row:
+            if cell_value not in value_map:
+                raise ValueError(f"Unknown cell value in recording: {cell_value}")
+            board_row.append(value_map[cell_value])
+        board_layout.append(board_row)
+
+    return board_layout
 
 
 class BoardGenerator:
@@ -273,14 +298,317 @@ class SolitaireGame:
         return self.board_layout
 
 
+class GameRecorder:
+    """Capture a complete game session and persist it as JSON."""
+
+    def __init__(self):
+        self.current_recording: Optional[dict[str, Any]] = None
+        self._recording_active = False
+        self._game_over_recorded = False
+
+    @property
+    def is_recording(self):
+        return self._recording_active
+
+    def start(self, board_type, board_size, mode_name, board_layout):
+        self.current_recording = {
+            "version": RECORDING_FILE_VERSION,
+            "mode_name": mode_name,
+            "events": [],
+        }
+        self._recording_active = True
+        self._game_over_recorded = False
+        self.record_start_new_game(
+            board_type=board_type,
+            board_size=board_size,
+            mode_name=mode_name,
+            board_layout=board_layout,
+        )
+        return self.current_recording
+
+    def stop(self):
+        self._recording_active = False
+        return self.current_recording
+
+    def _append_event(self, event_type, **event_data):
+        if not self._recording_active or self.current_recording is None:
+            return
+
+        event = {
+            "index": len(self.current_recording["events"]),
+            "type": event_type,
+        }
+        event.update(event_data)
+        self.current_recording["events"].append(event)
+
+    def record_start_new_game(self, board_type, board_size, mode_name, board_layout):
+        self._game_over_recorded = False
+        replacement_event = {
+            "index": 0,
+            "type": "start_new_game",
+            "board_type": board_type,
+            "board_size": board_size,
+            "mode_name": mode_name,
+            "board_after": serialize_board_layout(board_layout),
+        }
+
+        # If recording started and the user immediately begins a fresh game,
+        # replace the seed state so the first entry reflects that new setup.
+        if self._recording_active and self.current_recording is not None:
+            events = self.current_recording["events"]
+            if len(events) == 1 and events[0].get("type") == "start_new_game":
+                events[0] = replacement_event
+                return
+
+        self._append_event(
+            "start_new_game",
+            board_type=board_type,
+            board_size=board_size,
+            mode_name=mode_name,
+            board_after=serialize_board_layout(board_layout),
+        )
+
+    def record_move(self, start_pos, end_pos, move_source, board_layout):
+        self._append_event(
+            "move",
+            start_pos=list(start_pos),
+            end_pos=list(end_pos),
+            move_source=move_source,
+            board_after=serialize_board_layout(board_layout),
+        )
+
+    def record_randomize(self, peg_probability, seed, board_layout):
+        self._append_event(
+            "randomize",
+            peg_probability=peg_probability,
+            seed=seed,
+            board_after=serialize_board_layout(board_layout),
+        )
+
+    def record_game_over(self, score_rating):
+        if self._game_over_recorded:
+            return
+        self._append_event("game_over", score_rating=score_rating)
+        self._game_over_recorded = True
+
+    def save_to_file(self, file_path):
+        if self.current_recording is None:
+            raise ValueError("No recording data is available to save.")
+
+        with open(file_path, "w", encoding="utf-8") as output_file:
+            json.dump(self.current_recording, output_file, indent=2)
+
+    @staticmethod
+    def load_from_file(file_path):
+        with open(file_path, "r", encoding="utf-8") as input_file:
+            recording_data = json.load(input_file)
+
+        if not isinstance(recording_data, dict):
+            raise ValueError("Recording file has an invalid format.")
+        if recording_data.get("version") != RECORDING_FILE_VERSION:
+            raise ValueError("Unsupported recording file version.")
+        if not isinstance(recording_data.get("events"), list):
+            raise ValueError("Recording file is missing the events array.")
+
+        return recording_data
+
+
+class GameReplayer:
+    """Replay a previously recorded session onto a controller."""
+
+    @staticmethod
+    def replay(recording_data, controller):
+        events = recording_data.get("events", [])
+        if not events:
+            raise ValueError("Recording has no events to replay.")
+
+        replayed_moves = 0
+        controller._is_replaying = True
+
+        try:
+            for event in events:
+                event_type = event.get("type")
+
+                if event_type == "start_new_game":
+                    board_type = event.get("board_type", controller.game.board_type)
+                    board_size = event.get("board_size", controller.game.board_size)
+
+                    controller.start_new_game(board_type=board_type, board_size=board_size)
+
+                    if "board_after" in event:
+                        controller.board_layout = deserialize_board_layout(event["board_after"])
+                        controller.clear_selection()
+                        controller._game_over_fired = False
+                        controller._check_and_notify_game_over()
+
+                elif event_type == "move":
+                    start_pos = tuple(event["start_pos"])
+                    end_pos = tuple(event["end_pos"])
+
+                    if not controller.perform_move(start_pos, end_pos, move_source="replay"):
+                        raise ValueError(
+                            f"Replay failed at move event #{event.get('index', '?')}: "
+                            f"{start_pos} -> {end_pos}"
+                        )
+
+                    replayed_moves += 1
+                    GameReplayer._assert_expected_board(controller.board_layout, event)
+
+                elif event_type == "randomize":
+                    if "board_after" not in event:
+                        controller.randomize_board_state(
+                            peg_probability=event.get("peg_probability", 0.5),
+                            seed=event.get("seed"),
+                        )
+                    else:
+                        controller.board_layout = deserialize_board_layout(event["board_after"])
+                        controller.clear_selection()
+                        controller._game_over_fired = False
+                        controller._check_and_notify_game_over()
+
+                elif event_type == "game_over":
+                    expected_score = event.get("score_rating")
+                    if expected_score is not None and controller.is_game_over():
+                        actual_score = controller.get_score_rating()
+                        if actual_score != expected_score:
+                            raise ValueError(
+                                f"Replay score mismatch. Expected '{expected_score}', got '{actual_score}'."
+                            )
+
+                else:
+                    raise ValueError(f"Unsupported event type in recording: {event_type}")
+
+        finally:
+            controller._is_replaying = False
+
+        return {
+            "replayed_moves": replayed_moves,
+            "is_game_over": controller.is_game_over(),
+            "score_rating": controller.get_score_rating(),
+            "mode_name": recording_data.get("mode_name"),
+        }
+
+    @staticmethod
+    def replay_from_file(file_path, controller):
+        recording_data = GameRecorder.load_from_file(file_path)
+        return GameReplayer.replay(recording_data, controller)
+
+    @staticmethod
+    def _assert_expected_board(board_layout, event):
+        expected_board = event.get("board_after")
+        if expected_board is None:
+            return
+
+        actual_board = serialize_board_layout(board_layout)
+        if actual_board != expected_board:
+            raise ValueError(
+                f"Replay diverged at event #{event.get('index', '?')} ({event.get('type')})."
+            )
+
+
+class ReplaySession:
+    """Step-based replay cursor over recorded board snapshots."""
+
+    def __init__(self, recording_data):
+        if not isinstance(recording_data, dict):
+            raise ValueError("Replay data must be a dictionary.")
+
+        self.recording_data = recording_data
+        self.mode_name = recording_data.get("mode_name")
+        self._timeline = self._build_timeline(recording_data.get("events", []))
+        if not self._timeline:
+            raise ValueError("Recording does not contain replayable board states.")
+
+        self._position = 0
+
+    @property
+    def position(self):
+        return self._position
+
+    @property
+    def total_steps(self):
+        return len(self._timeline)
+
+    def can_step_next(self):
+        return self._position < self.total_steps - 1
+
+    def can_step_previous(self):
+        return self._position > 0
+
+    def current_snapshot(self):
+        return self._timeline[self._position]
+
+    def step_next(self):
+        if self.can_step_next():
+            self._position += 1
+        return self.current_snapshot()
+
+    def step_previous(self):
+        if self.can_step_previous():
+            self._position -= 1
+        return self.current_snapshot()
+
+    def jump_to_complete(self):
+        self._position = self.total_steps - 1
+        return self.current_snapshot()
+
+    def apply_current_to_controller(self, controller):
+        snapshot = self.current_snapshot()
+        controller.set_board_state_for_replay(
+            board_layout=deserialize_board_layout(snapshot["board_after"]),
+            board_type=snapshot.get("board_type"),
+            board_size=snapshot.get("board_size"),
+        )
+        return snapshot
+
+    @staticmethod
+    def from_file(file_path):
+        recording_data = GameRecorder.load_from_file(file_path)
+        return ReplaySession(recording_data)
+
+    @staticmethod
+    def _build_timeline(events):
+        if not isinstance(events, list):
+            raise ValueError("Recording events must be a list.")
+
+        timeline = []
+        current_board_type = None
+        current_board_size = None
+
+        for event in events:
+            event_type = event.get("type")
+            board_after = event.get("board_after")
+
+            if event_type == "start_new_game":
+                current_board_type = event.get("board_type")
+                current_board_size = event.get("board_size")
+
+            if board_after is None:
+                continue
+
+            timeline.append(
+                {
+                    "event_index": event.get("index"),
+                    "event_type": event_type,
+                    "board_type": event.get("board_type", current_board_type),
+                    "board_size": event.get("board_size", current_board_size),
+                    "board_after": board_after,
+                }
+            )
+
+        return timeline
+
+
 class SolitaireGameController:
     """Chatgpted class that manages game state and interactions between the SolitaireGame and the UI.
     """
 
     def __init__(self, game=None):
         self.game = game if game is not None else SolitaireGame()
+        self.recorder = GameRecorder()
         self.selected_peg = None
         self._game_over_fired = False
+        self._is_replaying = False
 
         # Callbacks the UI can register to react to game events.
         # on_move(start_pos, end_pos)  - called after a successful move
@@ -304,14 +632,64 @@ class SolitaireGameController:
     # Game lifecycle
     # ------------------------------------------------------------------
 
-    def start_new_game(self, board_type=None, board_size=None):
+    def start_new_game(self, board_type=None, board_size=None, mode_name=None):
         """Reset the board and clear transient state."""
         self.selected_peg = None
         self._game_over_fired = False
-        return self.game.start_new_game(board_type=board_type, board_size=board_size)
+        board_layout = self.game.start_new_game(board_type=board_type, board_size=board_size)
+
+        if self.recorder.is_recording and not self._is_replaying:
+            self.recorder.record_start_new_game(
+                board_type=self.game.board_type,
+                board_size=self.game.board_size,
+                mode_name=mode_name,
+                board_layout=board_layout,
+            )
+
+        return board_layout
 
     def clear_selection(self):
         self.selected_peg = None
+
+    def is_recording(self):
+        return self.recorder.is_recording
+
+    def start_recording(self, mode_name="Manual"):
+        return self.recorder.start(
+            board_type=self.game.board_type,
+            board_size=self.game.board_size,
+            mode_name=mode_name,
+            board_layout=self.game.board_layout,
+        )
+
+    def stop_recording(self):
+        if self.recorder.is_recording and self.is_game_over():
+            self.recorder.record_game_over(self.get_score_rating())
+        return self.recorder.stop()
+
+    def save_recording(self, file_path):
+        self.recorder.save_to_file(file_path)
+
+    def replay_from_file(self, file_path):
+        return GameReplayer.replay_from_file(file_path, self)
+
+    def create_replay_session_from_file(self, file_path):
+        return ReplaySession.from_file(file_path)
+
+    def set_board_state_for_replay(self, board_layout, board_type=None, board_size=None):
+        """Set controller state from replay data without recording new events."""
+        self._is_replaying = True
+        try:
+            if board_type is not None:
+                self.game.board_type = board_type
+            if board_size is not None:
+                self.game.board_size = board_size
+
+            self.board_layout = board_layout
+            self.selected_peg = None
+            self._game_over_fired = self.is_game_over()
+        finally:
+            self._is_replaying = False
 
     def randomize_board_state(self, peg_probability=0.5, seed=None):
         """Randomize current board state for manual play experimentation."""
@@ -319,6 +697,14 @@ class SolitaireGameController:
         self.game.randomize_board_state(peg_probability=peg_probability, rng=rng)
         self.selected_peg = None
         self._game_over_fired = False
+
+        if self.recorder.is_recording and not self._is_replaying:
+            self.recorder.record_randomize(
+                peg_probability=peg_probability,
+                seed=seed,
+                board_layout=self.game.board_layout,
+            )
+
         self._check_and_notify_game_over()
         return self.game.board_layout
 
@@ -358,7 +744,7 @@ class SolitaireGameController:
             start_pos = self.selected_peg
             end_pos = (row, col)
 
-            if self.perform_move(start_pos, end_pos):
+            if self.perform_move(start_pos, end_pos, move_source="manual"):
                 self.selected_peg = None
                 return "moved"
 
@@ -367,10 +753,19 @@ class SolitaireGameController:
 
         return "ignored"
 
-    def perform_move(self, start_pos, end_pos):
+    def perform_move(self, start_pos, end_pos, move_source="manual"):
         """Attempt one move and emit callbacks when successful."""
         if not self.game.make_move(start_pos, end_pos):
             return False
+
+        if self.recorder.is_recording and not self._is_replaying:
+            self.recorder.record_move(
+                start_pos=start_pos,
+                end_pos=end_pos,
+                move_source=move_source,
+                board_layout=self.game.board_layout,
+            )
+
         self._notify_move(start_pos, end_pos)
         self._check_and_notify_game_over()
         return True
@@ -388,6 +783,10 @@ class SolitaireGameController:
         """Fire on_game_over exactly once when no valid moves remain."""
         if not self._game_over_fired and self.is_game_over():
             self._game_over_fired = True
+
+            if self.recorder.is_recording and not self._is_replaying:
+                self.recorder.record_game_over(self.get_score_rating())
+
             if callable(self.on_game_over):
                 self.on_game_over(self.get_score_rating())
 
@@ -405,7 +804,12 @@ class GameMode(ABC):
         self.controller = controller
 
     def start_new_game(self, board_type=None, board_size=None):
-        return self.controller.start_new_game(board_type=board_type, board_size=board_size)
+        mode_name = self.__class__.__name__.replace("GameMode", "")
+        return self.controller.start_new_game(
+            board_type=board_type,
+            board_size=board_size,
+            mode_name=mode_name,
+        )
 
     def is_game_over(self):
         return self.controller.is_game_over()
@@ -433,7 +837,7 @@ class AutomatedGameMode(GameMode):
             return False
 
         start_pos, end_pos = random.choice(moves)
-        return self.controller.perform_move(start_pos, end_pos)
+        return self.controller.perform_move(start_pos, end_pos, move_source="automated")
 
     def play_until_game_over(self, max_steps=10000):
         """Play random legal moves until no moves remain."""

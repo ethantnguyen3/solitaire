@@ -1,6 +1,6 @@
 import tkinter as tk
 import math
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import game_engine
 
 
@@ -15,9 +15,12 @@ class SolitaireGUI:
         self.size_var = tk.StringVar(value="7")
         self.type_var = tk.StringVar(value=game_engine.BoardType.ENGLISH)
         self.mode_var = tk.StringVar(value="Manual")
+        self.record_btn_text = tk.StringVar(value="Start Recording")
         self.autoplay_btn_text = tk.StringVar(value="Start Autoplay")
+        self.replay_status_text = tk.StringVar(value="Replay: not loaded")
         self._auto_job = None
         self.autoplay_running = False
+        self.replay_session = None
 
         # --- Control Panel Setup ---
         control_frame = tk.Frame(root)
@@ -46,8 +49,47 @@ class SolitaireGUI:
         )
 
         tk.Button(control_frame, text="New Game", command=self.new_game).grid(row=3, column=0, pady=10)
+        tk.Button(control_frame, text="Randomize", command=self.randomize_board).grid(row=3, column=1, pady=10)
+        tk.Button(control_frame, textvariable=self.record_btn_text, command=self.toggle_recording).grid(
+            row=3, column=2, pady=10
+        )
+        tk.Button(control_frame, text="Load Replay", command=self.replay_recording_from_file).grid(
+            row=3, column=3, pady=10
+        )
         tk.Button(control_frame, textvariable=self.autoplay_btn_text, command=self.toggle_autoplay).grid(
-            row=3, column=1, pady=10
+            row=3, column=4, pady=10
+        )
+
+        self.prev_replay_btn = tk.Button(
+            control_frame,
+            text="Previous Move",
+            command=self.replay_previous_move,
+            state=tk.DISABLED,
+        )
+        self.prev_replay_btn.grid(row=4, column=1, pady=5)
+
+        self.next_replay_btn = tk.Button(
+            control_frame,
+            text="Next Move",
+            command=self.replay_next_move,
+            state=tk.DISABLED,
+        )
+        self.next_replay_btn.grid(row=4, column=2, pady=5)
+
+        self.complete_replay_btn = tk.Button(
+            control_frame,
+            text="Complete",
+            command=self.replay_complete,
+            state=tk.DISABLED,
+        )
+        self.complete_replay_btn.grid(row=4, column=3, pady=5)
+
+        tk.Label(control_frame, textvariable=self.replay_status_text).grid(
+            row=5,
+            column=0,
+            columnspan=5,
+            sticky=tk.W,
+            pady=5,
         )
 
         # --- Canvas Setup ---
@@ -75,6 +117,7 @@ class SolitaireGUI:
     def new_game(self):
         """Read UI controls and ask the controller to start a fresh game."""
         self.stop_autoplay()
+        self._clear_replay_session()
 
         try:
             board_size = int(self.size_var.get())
@@ -84,11 +127,181 @@ class SolitaireGUI:
         board_type = self.type_var.get()
         mode_name = self.mode_var.get()
 
-        self.controller.start_new_game(board_type=board_type, board_size=board_size)
+        self.controller.start_new_game(board_type=board_type, board_size=board_size, mode_name=mode_name)
         self._redraw_board()
 
         if mode_name == "Automated":
             self.start_autoplay()
+
+    def randomize_board(self):
+        """Randomize the current board state and redraw."""
+        if self.replay_session is not None:
+            messagebox.showwarning("Replay Active", "Start a new game to exit replay mode first.")
+            return
+
+        self.stop_autoplay()
+        self.controller.randomize_board_state()
+        self._redraw_board()
+
+    def toggle_recording(self):
+        if self.replay_session is not None:
+            messagebox.showwarning("Replay Active", "Start a new game to exit replay mode first.")
+            return
+
+        if self.controller.is_recording():
+            self._stop_and_save_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self):
+        self.controller.start_recording(mode_name=self.mode_var.get())
+        self.record_btn_text.set("Stop & Save Recording")
+
+    def _stop_and_save_recording(self):
+        recording = self.controller.stop_recording()
+        self.record_btn_text.set("Start Recording")
+
+        if recording is None:
+            messagebox.showwarning("Recording", "No recording data is available to save.")
+            return
+
+        file_path = self._ask_recording_save_path("Save Game Recording")
+        if not file_path:
+            return
+
+        try:
+            self.controller.save_recording(file_path)
+        except Exception as ex:
+            messagebox.showerror("Recording Error", f"Failed to save recording:\n{ex}")
+            return
+
+        messagebox.showinfo("Recording Saved", f"Recording saved to:\n{file_path}")
+
+    def _ask_recording_save_path(self, title):
+        return filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=".json",
+            filetypes=[("JSON Files", "*.json"), ("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+
+    def _auto_finalize_recording_after_game_over(self):
+        recording = self.controller.stop_recording()
+        self.record_btn_text.set("Start Recording")
+        if recording is None:
+            return
+
+        file_path = self._ask_recording_save_path("Save Completed Game Recording")
+        if not file_path:
+            messagebox.showwarning(
+                "Recording",
+                "Recording was finalized but not saved because no file path was selected.",
+            )
+            return
+
+        try:
+            self.controller.save_recording(file_path)
+            messagebox.showinfo("Recording Saved", f"Recording saved to:\n{file_path}")
+        except Exception as ex:
+            messagebox.showerror("Recording Error", f"Failed to save recording:\n{ex}")
+
+    def replay_recording_from_file(self):
+        """Load a recording file and initialize step-by-step replay."""
+        if self.controller.is_recording():
+            messagebox.showwarning(
+                "Replay Blocked",
+                "Stop and save the active recording before replaying another session.",
+            )
+            return
+
+        self.stop_autoplay()
+
+        file_path = filedialog.askopenfilename(
+            title="Open Game Recording",
+            filetypes=[("JSON Files", "*.json"), ("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        try:
+            self.replay_session = self.controller.create_replay_session_from_file(file_path)
+            self.replay_session.apply_current_to_controller(self.controller)
+        except Exception as ex:
+            messagebox.showerror("Replay Error", f"Failed to replay recording:\n{ex}")
+            return
+
+        self._redraw_board()
+        self._update_replay_controls()
+
+        mode_name = self.replay_session.mode_name
+        if mode_name in ("Manual", "Automated"):
+            self.mode_var.set(mode_name)
+
+        messagebox.showinfo(
+            "Replay Loaded",
+            "Replay is loaded at the initial board state."
+            "\nUse Next Move / Previous Move / Complete to navigate.",
+        )
+
+    def replay_next_move(self):
+        if self.replay_session is None:
+            messagebox.showwarning("Replay", "Load a replay file first.")
+            return
+
+        if self.replay_session.can_step_next():
+            self.replay_session.step_next()
+
+        self.replay_session.apply_current_to_controller(self.controller)
+        self._redraw_board()
+        self._update_replay_controls()
+
+    def replay_previous_move(self):
+        if self.replay_session is None:
+            messagebox.showwarning("Replay", "Load a replay file first.")
+            return
+
+        if self.replay_session.can_step_previous():
+            self.replay_session.step_previous()
+
+        self.replay_session.apply_current_to_controller(self.controller)
+        self._redraw_board()
+        self._update_replay_controls()
+
+    def replay_complete(self):
+        if self.replay_session is None:
+            messagebox.showwarning("Replay", "Load a replay file first.")
+            return
+
+        self.replay_session.jump_to_complete()
+        self.replay_session.apply_current_to_controller(self.controller)
+        self._redraw_board()
+        self._update_replay_controls()
+        messagebox.showinfo("Replay Complete", "Replay Complete")
+
+    def _clear_replay_session(self):
+        self.replay_session = None
+        self._update_replay_controls()
+
+    def _update_replay_controls(self):
+        if self.replay_session is None:
+            self.prev_replay_btn.config(state=tk.DISABLED)
+            self.next_replay_btn.config(state=tk.DISABLED)
+            self.complete_replay_btn.config(state=tk.DISABLED)
+            self.replay_status_text.set("Replay: not loaded")
+            return
+
+        self.prev_replay_btn.config(
+            state=tk.NORMAL if self.replay_session.can_step_previous() else tk.DISABLED
+        )
+        self.next_replay_btn.config(
+            state=tk.NORMAL if self.replay_session.can_step_next() else tk.DISABLED
+        )
+        self.complete_replay_btn.config(state=tk.NORMAL)
+
+        snapshot = self.replay_session.current_snapshot()
+        self.replay_status_text.set(
+            f"Replay step {self.replay_session.position + 1}/{self.replay_session.total_steps}"
+            f" ({snapshot.get('event_type')})"
+        )
 
     # ------------------------------------------------------------------
     # Controller event callbacks
@@ -101,12 +314,20 @@ class SolitaireGUI:
     def _on_game_over(self, score_rating):
         """Called by the controller exactly once when no moves remain."""
         self.stop_autoplay()
+
+        if self.controller.is_recording():
+            self._auto_finalize_recording_after_game_over()
+
         messagebox.showinfo(
             "Game Over",
             f"No more valid moves are possible.\nRating: {score_rating}",
         )
 
     def start_autoplay(self):
+        if self.replay_session is not None:
+            messagebox.showwarning("Replay Active", "Start a new game to exit replay mode first.")
+            return
+
         if self.controller.is_game_over():
             return
         if self.autoplay_running:
@@ -135,6 +356,9 @@ class SolitaireGUI:
 
     def on_canvas_click(self, event):
         """Translate a raw canvas click into a controller call."""
+        if self.replay_session is not None:
+            return
+
         if self.autoplay_running:
             return
 
