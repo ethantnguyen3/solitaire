@@ -91,6 +91,9 @@ class SolitaireGUI:
             sticky=tk.W,
             pady=5,
         )
+        tk.Button(control_frame, text="Randomize Board", command=self.randomize_manual_board).grid(
+            row=3, column=2, pady=10
+        )
 
         # --- Canvas Setup ---
         self.cell_size = 50
@@ -349,6 +352,15 @@ class SolitaireGUI:
             self.stop_autoplay()
         else:
             self.start_autoplay()
+
+    def randomize_manual_board(self):
+        """Randomize board state while playing in Manual mode."""
+        if self.mode_var.get() != "Manual":
+            return
+        if self.autoplay_running:
+            self.stop_autoplay()
+        self.controller.randomize_board_state(peg_probability=0.5)
+        self._redraw_board()
 
     # ------------------------------------------------------------------
     # Canvas interaction
